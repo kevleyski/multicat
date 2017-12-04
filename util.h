@@ -1,7 +1,7 @@
 /*****************************************************************************
  * util.h: Utils for the multicat suite
  *****************************************************************************
- * Copyright (C) 2009, 2011 VideoLAN
+ * Copyright (C) 2009, 2011, 2014-2016 VideoLAN
  * $Id$
  *
  * Authors: Christophe Massiot <massiot@via.ecp.fr>
@@ -24,11 +24,19 @@
 #include <netinet/udp.h>
 #include <netinet/ip.h>
 
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#define POLLRDHUP 0
+/* uClibc may does not have clock_nanosleep() */
+#elif !defined (__UCLIBC__) || \
+       defined (__UCLIBC__) && defined (__UCLIBC_HAS_THREADS_NATIVE__) \
+                            && defined (__UCLIBC_HAS_ADVANCED_REALTIME__)
 #define HAVE_CLOCK_NANOSLEEP
+#endif
 
 #define DEFAULT_PORT 1234
 #define DEFAULT_PAYLOAD_SIZE 1316
 #define DEFAULT_ROTATE_SIZE UINT64_C(97200000000)
+#define DEFAULT_ROTATE_OFFSET UINT64_C(0)
 #define TS_SIZE 188
 #define RTP_HEADER_SIZE 12
 
@@ -37,12 +45,29 @@
 #define VERB_WARN 1
 
 /*****************************************************************************
+ * sockaddr_t: wrapper to avoid strict-aliasing issues
+ *****************************************************************************/
+typedef union
+{
+    struct sockaddr_storage ss;
+    struct sockaddr so;
+    struct sockaddr_in sin;
+    struct sockaddr_in6 sin6;
+} sockaddr_t;
+
+/*****************************************************************************
  * Raw udp packet structure with flexible-array payload
  *****************************************************************************/
 struct udprawpkt {
+#if !defined(__APPLE__)
+#if defined(__FreeBSD__)
+    struct  ip iph;
+#else
     struct  iphdr iph;
+#endif
     struct  udphdr udph;
-    uint8_t payload[];
+#endif
+    uint8_t payload[1024];
 } __attribute__((packed));
 
 
@@ -51,12 +76,15 @@ struct udprawpkt {
  *****************************************************************************/
  struct opensocket_opt {
     struct udprawpkt *p_raw_pktheader;
+    bool *pb_multicast;
  };
 
 
 /*****************************************************************************
  * Prototypes
  *****************************************************************************/
+void msg_Openlog( const char *ident, int option, int facility );
+void msg_Closelog( void );
 void msg_Info( void *_unused, const char *psz_format, ... );
 void msg_Err( void *_unused, const char *psz_format, ... );
 void msg_Warn( void *_unused, const char *psz_format, ... );
@@ -76,7 +104,8 @@ FILE *OpenAuxFile( const char *psz_arg, bool b_read, bool b_append );
 off_t LookupAuxFile( const char *psz_arg, int64_t i_wanted, bool b_absolute );
 void CheckFileSizes( const char *psz_file, const char *psz_aux_file,
                      size_t i_payload_size );
-uint64_t GetDirFile( uint64_t i_rotate_size, int64_t i_wanted );
+uint64_t GetDirFile( uint64_t i_rotate_size, uint64_t i_rotate_offset,
+                     int64_t i_wanted );
 int OpenDirFile( const char *psz_dir_path, uint64_t i_file, bool b_read,
                  size_t i_payload_size, FILE **pp_aux_file );
 off_t LookupDirAuxFile( const char *psz_dir_path, uint64_t i_file,

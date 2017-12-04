@@ -1,8 +1,7 @@
 /*****************************************************************************
  * aggregartp.c: split an RTP stream for several contribution links
  *****************************************************************************
- * Copyright (C) 2009, 2011 VideoLAN
- * $Id$
+ * Copyright (C) 2009, 2011, 2014-2017 VideoLAN
  *
  * Authors: Christophe Massiot <massiot@via.ecp.fr>
  *
@@ -36,6 +35,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <poll.h>
+#include <syslog.h>
 
 #include <bitstream/ietf/rtp.h>
 
@@ -46,12 +46,6 @@
 /*****************************************************************************
  * Local declarations
  *****************************************************************************/
-typedef union
-{
-    struct sockaddr_storage ss;
-    struct sockaddr so;
-} sockaddr_t;
-
 typedef struct block_t
 {
     uint8_t *p_data;
@@ -90,8 +84,9 @@ static uint64_t i_retx_buffer = DEFAULT_RETX_BUFFER * 27000;
 
 static void usage(void)
 {
-    msg_Raw( NULL, "Usage: aggregartp [-i <RT priority>] [-t <ttl>] [-w] [-o <SSRC IP>] [-U] [-x <retx buffer>] [-X <retx URL>] [-m <payload size>] [-R <RTP header>] @<src host> <dest host 1>[,<weight 1>] ... [<dest host N>,<weight N>]" );
+    msg_Raw( NULL, "Usage: aggregartp [-i <RT priority>] [-l <syslogtag>] [-t <ttl>] [-w] [-o <SSRC IP>] [-U] [-x <retx buffer>] [-X <retx URL>] [-m <payload size>] [-R <RTP header>] @<src host> <dest host 1>[,<weight 1>] ... [<dest host N>,<weight N>]" );
     msg_Raw( NULL, "    host format: [<connect addr>[:<connect port>]][@[<bind addr][:<bind port>]]" );
+    msg_Raw( NULL, "    weight: integer, higher value means more capacity, or 0 for all packets" );
     msg_Raw( NULL, "    -w: overwrite RTP timestamps" );
     msg_Raw( NULL, "    -o: overwrite RTP SSRC" );
     msg_Raw( NULL, "    -U: prepend RTP header" );
@@ -146,11 +141,24 @@ static void SendBlock( int i_fd, struct sockaddr *p_sout,
 }
 
 /*****************************************************************************
+ * SendBlock0: send a block to all outputs with weight 0
+ *****************************************************************************/
+static void SendBlock0( block_t *p_block )
+{
+    int i;
+    for ( i = 0; i < i_nb_outputs; i++ )
+        if ( !p_outputs[i].i_weight )
+            SendBlock( p_outputs[i].i_fd, NULL, 0, p_block);
+}
+
+/*****************************************************************************
  * RetxQueue: store a packet in the retx queue
  *****************************************************************************/
 static void RetxQueue( block_t *p_block, uint64_t i_current_date )
 {
     p_block->i_date = i_current_date;
+    p_block->p_next = NULL;
+    rtp_set_marker( p_block->p_data );
 
     /* Queue block */
     if ( p_retx_last != NULL )
@@ -176,15 +184,16 @@ static void RetxQueue( block_t *p_block, uint64_t i_current_date )
 /*****************************************************************************
  * RetxHandle: handle a retx query
  *****************************************************************************/
-static void RetxHandle(void)
+static void RetxHandle( int i_fd )
 {
     ssize_t i_size = RETX_HEADER_SIZE - p_retx_block->i_size;
     uint8_t *p_buffer = p_retx_block->p_data + p_retx_block->i_size;
     sockaddr_t sout;
     socklen_t i_len = sizeof(sout);
 
-    i_size = recvfrom( i_retx_fd, p_buffer, i_size, 0, &sout.so, &i_len );
-    if ( i_size < 0 && errno != EAGAIN && errno != EINTR )
+    i_size = recvfrom( i_fd, p_buffer, i_size, 0, &sout.so, &i_len );
+    if ( i_size < 0 && errno != EAGAIN && errno != EINTR &&
+         errno != ECONNREFUSED )
     {
         msg_Err( NULL, "unrecoverable read error, dying (%s)",
                  strerror(errno) );
@@ -227,7 +236,15 @@ static void RetxHandle(void)
 
     while ( i_num && p_block != NULL )
     {
-        SendBlock( i_retx_fd, i_len ? &sout.so : NULL, i_len, p_block );
+        if ( i_retx_fd == -1 )
+        {
+            output_t *p_output = NextOutput();
+            SendBlock( p_output->i_fd, NULL, 0, p_block );
+        }
+        else
+        {
+            SendBlock( i_retx_fd, i_len ? &sout.so : NULL, i_len, p_block );
+        }
         p_block = p_block->p_next;
         i_num--;
     }
@@ -244,16 +261,28 @@ int main( int i_argc, char **pp_argv )
 {
     int c;
     int i_priority = -1;
+    const char *psz_syslog_tag = NULL;
     int i_ttl = 0;
     bool b_udp = false;
-    struct pollfd pfd[2];
+    struct pollfd *pfd = malloc(sizeof(struct pollfd));
+    int i_nb_retx = 1;
+    int i_fd;
 
-    while ( (c = getopt( i_argc, pp_argv, "i:t:wo:x:X:Um:R:h" )) != -1 )
+#define ADD_RETX                                                            \
+    pfd = realloc( pfd, ++i_nb_retx * sizeof(struct pollfd) );              \
+    pfd[i_nb_retx - 1].fd = i_fd;                                           \
+    pfd[i_nb_retx - 1].events = POLLIN;
+
+    while ( (c = getopt( i_argc, pp_argv, "i:l:t:wo:x:X:Um:R:h" )) != -1 )
     {
         switch ( c )
         {
         case 'i':
             i_priority = strtol( optarg, NULL, 0 );
+            break;
+
+        case 'l':
+            psz_syslog_tag = optarg;
             break;
 
         case 't':
@@ -279,18 +308,14 @@ int main( int i_argc, char **pp_argv )
             break;
 
         case 'X':
-            i_retx_fd = OpenSocket( optarg, 0, 0, 0, NULL, &b_retx_tcp, NULL );
-            if ( i_retx_fd == -1 )
+            i_retx_fd = i_fd = OpenSocket( optarg, 0, 0, 0, NULL, &b_retx_tcp, NULL );
+            if ( i_fd == -1 )
             {
                 msg_Err( NULL, "unable to set up retx with %s\n", optarg );
                 exit(EXIT_FAILURE);
             }
-            pfd[1].fd = i_retx_fd;
-            pfd[1].events = POLLIN | POLLERR | POLLRDHUP | POLLHUP;
 
-            p_retx_block = malloc( sizeof(block_t) + RETX_HEADER_SIZE );
-            p_retx_block->p_data = (uint8_t *)p_retx_block + sizeof(block_t);
-            p_retx_block->i_size = 0;
+            ADD_RETX
             break;
 
         case 'U':
@@ -314,6 +339,9 @@ int main( int i_argc, char **pp_argv )
     if ( optind >= i_argc - 1 )
         usage();
 
+    if ( psz_syslog_tag != NULL )
+        msg_Openlog( psz_syslog_tag, LOG_NDELAY, LOG_USER );
+
     i_input_fd = OpenSocket( pp_argv[optind], 0, DEFAULT_PORT, 0, NULL,
                              &b_input_tcp, NULL );
     if ( i_input_fd == -1 )
@@ -328,10 +356,15 @@ int main( int i_argc, char **pp_argv )
 
     while ( optind < i_argc )
     {
+        bool b_multicast;
+        struct opensocket_opt opt;
+        memset(&opt, 0, sizeof(struct opensocket_opt));
+        opt.pb_multicast = &b_multicast;
+
         p_outputs = realloc( p_outputs, ++i_nb_outputs * sizeof(output_t) );
-        p_outputs[i_nb_outputs - 1].i_fd =
+        p_outputs[i_nb_outputs - 1].i_fd = i_fd =
             OpenSocket( pp_argv[optind++], i_ttl, 0, DEFAULT_PORT,
-                        &p_outputs[i_nb_outputs - 1].i_weight, NULL, NULL );
+                        &p_outputs[i_nb_outputs - 1].i_weight, NULL, &opt );
         if ( p_outputs[i_nb_outputs - 1].i_fd == -1 )
         {
             msg_Err( NULL, "unable to open output socket" );
@@ -341,9 +374,18 @@ int main( int i_argc, char **pp_argv )
         p_outputs[i_nb_outputs - 1].i_weighted_size =
             p_outputs[i_nb_outputs - 1].i_remainder = 0;
         i_max_weight += p_outputs[i_nb_outputs - 1].i_weight;
+
+        if ( i_retx_fd == -1 && !b_multicast )
+        {
+            ADD_RETX
+        }
     }
     msg_Dbg( NULL, "%d outputs weight %u%s", i_nb_outputs, i_max_weight,
-             i_retx_fd != -1 ? ", with retx" : "" );
+             i_nb_retx > 1 ? ", with retx" : "" );
+
+    p_retx_block = malloc( sizeof(block_t) + RETX_HEADER_SIZE );
+    p_retx_block->p_data = (uint8_t *)p_retx_block + sizeof(block_t);
+    p_retx_block->i_size = 0;
 
     if ( i_priority > 0 )
     {
@@ -363,7 +405,7 @@ int main( int i_argc, char **pp_argv )
     for ( ; ; )
     {
         uint64_t i_current_date;
-        if ( poll( pfd, i_retx_fd == -1 ? 1 : 2, -1 ) < 0 )
+        if ( poll( pfd, i_nb_retx, -1 ) < 0 )
         {
             int saved_errno = errno;
             msg_Warn( NULL, "couldn't poll(): %s", strerror(errno) );
@@ -371,14 +413,6 @@ int main( int i_argc, char **pp_argv )
             exit(EXIT_FAILURE);
         }
         i_current_date = wall_Date();
-
-        if ( (pfd[0].revents & (POLLERR | POLLRDHUP | POLLHUP)) ||
-             (i_retx_fd != -1 &&
-              (pfd[1].revents & (POLLERR | POLLRDHUP | POLLHUP))))
-        {
-            msg_Err( NULL, "poll error\n" );
-            exit(EXIT_FAILURE);
-        }
 
         if ( pfd[0].revents & POLLIN )
         {
@@ -417,7 +451,8 @@ int main( int i_argc, char **pp_argv )
             i_wanted_size -= p_input_block->i_size;
             i_size = read( i_input_fd, p_read_buffer, i_wanted_size );
 
-            if ( i_size < 0 && errno != EAGAIN && errno != EINTR )
+            if ( i_size < 0 && errno != EAGAIN && errno != EINTR &&
+                 errno != ECONNREFUSED )
             {
                 msg_Err( NULL, "unrecoverable read error, dying (%s)",
                          strerror(errno) );
@@ -453,26 +488,40 @@ int main( int i_argc, char **pp_argv )
             }
 
             /* Output block */
-            output_t *p_output = NextOutput();
-            SendBlock( p_output->i_fd, NULL, 0, p_input_block );
+            SendBlock0( p_input_block );
 
-            p_output->i_weighted_size += (i_size + p_output->i_remainder)
-                                           / p_output->i_weight;
-            p_output->i_remainder = (i_size + p_output->i_remainder)
-                                           % p_output->i_weight;
+            if ( i_max_weight )
+            {
+                output_t *p_output = NextOutput();
+                SendBlock( p_output->i_fd, NULL, 0, p_input_block );
 
-            if ( i_retx_fd != -1 )
-                RetxQueue( p_input_block, i_current_date );
-            else
-                free( p_input_block );
+                p_output->i_weighted_size += (i_size + p_output->i_remainder)
+                                               / p_output->i_weight;
+                p_output->i_remainder = (i_size + p_output->i_remainder)
+                                               % p_output->i_weight;
+            }
 
+            RetxQueue( p_input_block, i_current_date );
             p_input_block = NULL;
         }
+        else if ( (pfd[0].revents & (POLLERR | POLLRDHUP | POLLHUP)) )
+        {
+            msg_Err( NULL, "poll error\n" );
+            exit(EXIT_FAILURE);
+        }
 
-        if ( i_retx_fd != -1 && (pfd[1].revents & POLLIN) )
-            RetxHandle();
+        int i;
+        for ( i = 1; i < i_nb_retx; i++ )
+        {
+            if ( pfd[i].revents & POLLIN )
+            {
+                RetxHandle( pfd[i].fd );
+            }
+        }
     }
+
+    if ( psz_syslog_tag != NULL )
+        msg_Closelog();
 
     return EXIT_SUCCESS;
 }
-

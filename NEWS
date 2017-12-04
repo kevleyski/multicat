@@ -1,5 +1,33 @@
-$Id$
+Changes between 2.2 and 2.3:
+----------------------------
+  * New VRRP-like implementation multilive
+  * Fix potential segfault in aggregartp
+  * Do not do retx in reordertp with multicast inputs
+  * Add support for null weights in aggregartp and reordertp
+  * Add refractory period in case of too many errors in reordertp
 
+Changes between 2.1 and 2.2:
+----------------------------
+  * Various portability fixes
+  * Fix off-by-one error in directory input
+  * Don't bail out on missing segments
+  * Add option to shift segment start
+  * Fix incomplete read from FIFOs
+  * Fix ingesTS behaviour with more than 1 PCR/packet
+
+Changes between 2.0 and 2.1:
+----------------------------
+  * FreeBSD and Mac OS X support
+  * Support for changing source address with raw sockets
+  * Fix overflow in date calculation on 32 bit platforms
+  * New fd= interface option
+  * Reorder packets based on sequence numbers instead of timestamps
+  * Add ability to cap the number of retx requests in reordertp
+  * Allow retransmission to work without a dedicated connection
+  * Add options to fix continuity counters and restamp dates
+  * Use SO_BINDTODEVICE to bind to a specific interface
+  * Add option for syslog logging
+  
 Changes between 1.0 and 2.0:
 ----------------------------
   * Support for directory input/output, where the stream is stored into

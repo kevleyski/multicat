@@ -1,7 +1,7 @@
 /*****************************************************************************
  * multicat.c: netcat-equivalent for multicast
  *****************************************************************************
- * Copyright (C) 2009, 2011-2012 VideoLAN
+ * Copyright (C) 2009, 2011-2012, 2015-2016 VideoLAN
  * $Id$
  *
  * Authors: Christophe Massiot <massiot@via.ecp.fr>
@@ -42,6 +42,11 @@
 #include <pthread.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <syslog.h>
+
+#ifdef __FreeBSD__
+#   include <sys/uio.h>
+#endif
 
 #ifdef SIOCGSTAMPNS
 #   define HAVE_TIMESTAMPS
@@ -53,13 +58,18 @@
 
 #include <bitstream/ietf/rtp.h>
 #include <bitstream/mpeg/ts.h>
+#include <bitstream/mpeg/pes.h>
 
 #include "util.h"
 
 #undef DEBUG_WRITEBACK
 #define POLL_TIMEOUT 1000 /* 1 s */
 #define MAX_LATENESS INT64_C(27000000) /* 1 s */
-#define FILE_FLUSH INT64_C(27000000) /* 1 s */
+#define FILE_FLUSH INT64_C(2700000) /* 100 ms */
+#define MAX_PIDS 8192
+#define POW2_33 UINT64_C(8589934592)
+#define TS_CLOCK_MAX (POW2_33 * 27000000 / 90000)
+#define MAX_PCR_INTERVAL (27000000 / 2)
 
 /*****************************************************************************
  * Local declarations
@@ -75,37 +85,47 @@ static bool b_input_udp = false, b_output_udp = false;
 static size_t i_asked_payload_size = DEFAULT_PAYLOAD_SIZE;
 static size_t i_rtp_header_size = RTP_HEADER_SIZE;
 static uint64_t i_rotate_size = DEFAULT_ROTATE_SIZE;
-struct udprawpkt pktheader;
-bool b_raw_packets = false;
+static uint64_t i_rotate_offset = DEFAULT_ROTATE_OFFSET;
+static uint64_t i_duration = 0;
+static struct udprawpkt pktheader;
+static bool b_raw_packets = false;
+static uint8_t *pi_pid_cc_table = NULL;
+/* PCR/PTS/DTS restamping */
+static uint64_t i_last_pcr_date;
+static uint64_t i_last_pcr = TS_CLOCK_MAX;
+static uint64_t i_pcr_offset;
 
-static volatile sig_atomic_t b_die = 0;
+static volatile sig_atomic_t b_die = 0, b_error = 0;
 static uint16_t i_rtp_seqnum;
 static uint64_t i_stc = 0; /* system time clock, used for date calculations */
 static uint64_t i_first_stc = 0;
 static uint64_t i_pcr = 0, i_pcr_stc = 0; /* for RTP/TS output */
-uint64_t (*pf_Date)(void) = wall_Date;
-void (*pf_Sleep)( uint64_t ) = wall_Sleep;
-ssize_t (*pf_Read)( void *p_buf, size_t i_len );
-bool (*pf_Delay)(void) = NULL;
-void (*pf_ExitRead)(void);
-ssize_t (*pf_Write)( const void *p_buf, size_t i_len );
-void (*pf_ExitWrite)(void);
+static uint64_t (*pf_Date)(void) = wall_Date;
+static void (*pf_Sleep)( uint64_t ) = wall_Sleep;
+static ssize_t (*pf_Read)( void *p_buf, size_t i_len );
+static bool (*pf_Delay)(void) = NULL;
+static void (*pf_ExitRead)(void);
+static ssize_t (*pf_Write)( const void *p_buf, size_t i_len );
+static void (*pf_ExitWrite)(void);
 
 static void usage(void)
 {
-    msg_Raw( NULL, "Usage: multicat [-i <RT priority>] [-t <ttl>] [-X] [-T <file name>] [-f] [-p <PCR PID>] [-s <chunks>] [-n <chunks>] [-k <start time>] [-d <duration>] [-a] [-r <file duration>] [-S <SSRC IP>] [-u] [-U] [-m <payload size>] [-R <RTP header size>] [-w] <input item> <output item>" );
+    msg_Raw( NULL, "Usage: multicat [-i <RT priority>] [-l <syslogtag>] [-t <ttl>] [-X] [-T <file name>] [-f] [-p <PCR PID>] [-C] [-P] [-s <chunks>] [-n <chunks>] [-k <start time>] [-d <duration>] [-a] [-r <file duration>] [-O <rotate offset>] [-S <SSRC IP>] [-u] [-U] [-m <payload size>] [-R <RTP header size>] [-w] <input item> <output item>" );
     msg_Raw( NULL, "    item format: <file path | device path | FIFO path | directory path | network host>" );
     msg_Raw( NULL, "    host format: [<connect addr>[:<connect port>]][@[<bind addr][:<bind port>]]" );
     msg_Raw( NULL, "    -X: also pass-through all packets to stdout" );
     msg_Raw( NULL, "    -T: write an XML file with the current characteristics of transmission" );
     msg_Raw( NULL, "    -f: output packets as fast as possible" );
     msg_Raw( NULL, "    -p: overwrite or create RTP timestamps using PCR PID (MPEG-2/TS)" );
+    msg_Raw( NULL, "    -C: rewrite continuity counters to be continuous" );
+    msg_Raw( NULL, "    -P: restamp PCRs, DTSs, and PTSs" );
     msg_Raw( NULL, "    -s: skip the first N chunks of payload [deprecated]" );
     msg_Raw( NULL, "    -n: exit after playing N chunks of payload [deprecated]" );
     msg_Raw( NULL, "    -k: start at the given position (in 27 MHz units, negative = from the end)" );
     msg_Raw( NULL, "    -d: exit after definite time (in 27 MHz units)" );
     msg_Raw( NULL, "    -a: append to existing destination file (risky)" );
     msg_Raw( NULL, "    -r: in directory mode, rotate file after this duration (default: 97200000000 ticks = 1 hour)" );
+    msg_Raw( NULL, "    -O: in directory mode, rotate file after duration + this offset (default: 0 tick = calendar hour)" );
     msg_Raw( NULL, "    -S: overwrite or create RTP SSRC" );
     msg_Raw( NULL, "    -u: source has no RTP header" );
     msg_Raw( NULL, "    -U: destination has no RTP header" );
@@ -120,7 +140,7 @@ static void usage(void)
  *****************************************************************************/
 static void SigHandler( int i_signal )
 {
-    b_die = 1;
+    b_die = b_error = 1;
 }
 
 /*****************************************************************************
@@ -138,13 +158,13 @@ static bool Poll(void)
     if ( i_ret < 0 )
     {
         msg_Err( NULL, "poll error (%s)", strerror(errno) );
-        b_die = 1;
+        b_die = b_error = 1;
         return false;
     }
     if ( pfd.revents & (POLLERR | POLLRDHUP | POLLHUP) )
     {
         msg_Err( NULL, "poll error" );
-        b_die = 1;
+        b_die = b_error = 1;
         return false;
     }
     if ( !i_ret ) return false;
@@ -171,7 +191,7 @@ static ssize_t tcp_Read( void *p_buf, size_t i_len )
     if ( (i_read_size = recv( i_input_fd, p_read_buffer, i_read_size, 0 )) < 0 )
     {
         msg_Err( NULL, "recv error (%s)", strerror(errno) );
-        b_die = 1;
+        b_die = b_error = 1;
         return 0;
     }
 
@@ -209,7 +229,7 @@ static ssize_t udp_Read( void *p_buf, size_t i_len )
         if ( (i_ret = recv( i_input_fd, p_buf, i_len, 0 )) < 0 )
         {
             msg_Err( NULL, "recv error (%s)", strerror(errno) );
-            b_die = 1;
+            b_die = b_error = 1;
             return 0;
         }
 
@@ -259,15 +279,20 @@ static int udp_InitRead( const char *psz_arg, size_t i_len,
 
 static ssize_t raw_Write( const void *p_buf, size_t i_len )
 {
+#ifndef __APPLE__
     ssize_t i_ret;
     struct iovec iov[2];
 
-    #ifdef __FAVOR_BSD
+    #if defined(__FreeBSD__)
     pktheader.udph.uh_ulen
     #else
     pktheader.udph.len
     #endif
     = htons(sizeof(struct udphdr) + i_len);
+
+    #if defined(__FreeBSD__)
+    pktheader.iph.ip_len = htons(sizeof(struct udprawpkt) + i_len);
+    #endif
 
     iov[0].iov_base = &pktheader;
     iov[0].iov_len = sizeof(struct udprawpkt);
@@ -280,13 +305,16 @@ static ssize_t raw_Write( const void *p_buf, size_t i_len )
         if ( errno == EBADF || errno == ECONNRESET || errno == EPIPE )
         {
             msg_Err( NULL, "write error (%s)", strerror(errno) );
-            b_die = 1;
+            b_die = b_error = 1;
         }
         /* otherwise do not set b_die because these errors can be transient */
         return 0;
     }
 
     return i_ret;
+#else
+    return -1;
+#endif
 }
 
 /* Please note that the write functions also work for TCP */
@@ -298,7 +326,7 @@ static ssize_t udp_Write( const void *p_buf, size_t i_len )
         if ( errno == EBADF || errno == ECONNRESET || errno == EPIPE )
         {
             msg_Err( NULL, "write error (%s)", strerror(errno) );
-            b_die = 1;
+            b_die = b_error = 1;
         }
         /* otherwise do not set b_die because these errors can be transient */
         return 0;
@@ -336,6 +364,7 @@ static int udp_InitWrite( const char *psz_arg, size_t i_len, bool b_append )
  * stream_*: FIFO and character device handlers
  *****************************************************************************/
 static off_t i_stream_nb_skips = 0;
+static ssize_t i_buf_offset = 0;
 
 static ssize_t stream_Read( void *p_buf, size_t i_len )
 {
@@ -349,14 +378,22 @@ static ssize_t stream_Read( void *p_buf, size_t i_len )
         return 0;
     }
 
-    if ( (i_ret = read( i_input_fd, p_buf, i_len )) < 0 )
+    if ( (i_ret = read( i_input_fd, p_buf + i_buf_offset,
+                        i_len - i_buf_offset )) < 0 )
     {
         msg_Err( NULL, "read error (%s)", strerror(errno) );
-        b_die = 1;
+        b_die = b_error = 1;
         return 0;
     }
 
     i_stc = pf_Date();
+    i_buf_offset += i_ret;
+
+    if ( i_buf_offset < i_len )
+        return 0;
+
+    i_ret = i_buf_offset;
+    i_buf_offset = 0;
     if ( i_stream_nb_skips )
     {
         i_stream_nb_skips--;
@@ -376,6 +413,7 @@ static int stream_InitRead( const char *psz_arg, size_t i_len,
     if ( i_pos ) return -1;
 
     i_input_fd = OpenFile( psz_arg, true, false );
+    if ( i_input_fd < 0 ) return -1;
     i_stream_nb_skips = i_nb_skipped_chunks;
 
     pf_Read = stream_Read;
@@ -392,7 +430,7 @@ retry:
         if (errno == EAGAIN || errno == EINTR)
             goto retry;
         msg_Err( NULL, "write error (%s)", strerror(errno) );
-        b_die = 1;
+        b_die = b_error = 1;
     }
     return i_ret;
 }
@@ -405,6 +443,7 @@ static void stream_ExitWrite(void)
 static int stream_InitWrite( const char *psz_arg, size_t i_len, bool b_append )
 {
     i_output_fd = OpenFile( psz_arg, false, b_append );
+    if ( i_output_fd < 0 ) return -1;
 
     pf_Write = stream_Write;
     pf_ExitWrite = stream_ExitWrite;
@@ -424,7 +463,7 @@ static ssize_t file_Read( void *p_buf, size_t i_len )
     if ( (i_ret = read( i_input_fd, p_buf, i_len )) < 0 )
     {
         msg_Err( NULL, "read error (%s)", strerror(errno) );
-        b_die = 1;
+        b_die = b_error = 1;
         return 0;
     }
     if ( i_ret == 0 )
@@ -437,7 +476,7 @@ static ssize_t file_Read( void *p_buf, size_t i_len )
     if ( fread( p_aux, 8, 1, p_input_aux ) != 1 )
     {
         msg_Warn( NULL, "premature end of aux file reached" );
-        b_die = 1;
+        b_die = b_error = 1;
         return 0;
     }
     i_stc = FromSTC( p_aux );
@@ -494,8 +533,14 @@ static int file_InitRead( const char *psz_arg, size_t i_len,
     }
 
     i_input_fd = OpenFile( psz_arg, true, false );
+    if ( i_input_fd < 0 )
+    {
+        free(psz_aux_file);
+        return -1;
+    }
     p_input_aux = OpenAuxFile( psz_aux_file, true, false );
     free( psz_aux_file );
+    if ( p_input_aux == NULL ) return -1;
 
     lseek( i_input_fd, (off_t)i_len * i_nb_skipped_chunks, SEEK_SET );
     fseeko( p_input_aux, 8 * i_nb_skipped_chunks, SEEK_SET );
@@ -517,7 +562,7 @@ static ssize_t file_Write( const void *p_buf, size_t i_len )
     if ( (i_ret = write( i_output_fd, p_buf, i_len )) < 0 )
     {
         msg_Err( NULL, "couldn't write to file (%s)", strerror(errno) );
-        b_die = 1;
+        b_die = b_error = 1;
         return i_ret;
     }
 #ifdef DEBUG_WRITEBACK
@@ -530,7 +575,7 @@ static ssize_t file_Write( const void *p_buf, size_t i_len )
     if ( fwrite( p_aux, 8, 1, p_output_aux ) != 1 )
     {
         msg_Err( NULL, "couldn't write to auxiliary file" );
-        b_die = 1;
+        b_die = b_error = 1;
     }
     if (!i_file_next_flush)
         i_file_next_flush = i_stc + FILE_FLUSH;
@@ -555,8 +600,10 @@ static int file_InitWrite( const char *psz_arg, size_t i_len, bool b_append )
     if ( b_append )
         CheckFileSizes( psz_arg, psz_aux_file, i_len );
     i_output_fd = OpenFile( psz_arg, false, b_append );
+    if ( i_output_fd < 0 ) return -1;
     p_output_aux = OpenAuxFile( psz_aux_file, false, b_append );
     free( psz_aux_file );
+    if ( p_output_aux == NULL ) return -1;
 
     pf_Write = file_Write;
     pf_ExitWrite = file_ExitWrite;
@@ -573,29 +620,36 @@ static uint64_t i_input_dir_delay;
 
 static ssize_t dir_Read( void *p_buf, size_t i_len )
 {
-    ssize_t i_ret;
-try_again:
-    i_ret = file_Read( p_buf, i_len );
-    if ( !i_ret )
+    for ( ; ; )
     {
+        ssize_t i_ret = file_Read( p_buf, i_len );
+        if ( i_ret > 0 ) return i_ret;
+
         b_die = 0; /* we're not dead yet */
         close( i_input_fd );
         fclose( p_input_aux );
         i_input_fd = 0;
+        p_input_aux = NULL;
 
-        i_input_dir_file++;
-
-        i_input_fd = OpenDirFile( psz_input_dir_name, i_input_dir_file,
-                                  true, i_input_dir_len, &p_input_aux );
-        if ( i_input_fd < 0 )
+        for ( ; ; )
         {
-            msg_Err( NULL, "end of files reached" );
-            b_die = 1;
-            return 0;
+            i_input_dir_file++;
+
+            i_input_fd = OpenDirFile( psz_input_dir_name, i_input_dir_file,
+                                      true, i_input_dir_len, &p_input_aux );
+            if ( i_input_fd > 0 ) break;
+
+            if ( i_input_dir_file * i_rotate_size + i_rotate_offset >
+                 i_first_stc + i_duration )
+            {
+                msg_Err( NULL, "end of files reached" );
+                b_die = 1;
+                return 0;
+            }
+
+            msg_Warn( NULL, "missing segment" );
         }
-        goto try_again;
     }
-    return i_ret;
 }
 
 static bool dir_Delay(void)
@@ -616,7 +670,7 @@ static bool dir_Delay(void)
 static void dir_ExitRead(void)
 {
     free( psz_input_dir_name );
-    if ( i_input_fd )
+    if ( i_input_fd > 0 )
     {
         close( i_input_fd );
         fclose( p_input_aux );
@@ -644,23 +698,24 @@ static int dir_InitRead( const char *psz_arg, size_t i_len,
 
     psz_input_dir_name = strdup( psz_arg );
     i_input_dir_len = i_len;
-    i_input_dir_file = GetDirFile( i_rotate_size, i_pos );
+    i_input_dir_file = GetDirFile( i_rotate_size, i_rotate_offset, i_pos );
 
-    i_nb_skipped_chunks = LookupDirAuxFile( psz_input_dir_name,
-                                            i_input_dir_file, i_stc,
-                                            i_input_dir_len );
-    if ( i_nb_skipped_chunks < 0 )
+    for ( ; ; )
     {
-        /* Try at most one more chunk */
-        i_input_dir_file++;
         i_nb_skipped_chunks = LookupDirAuxFile( psz_input_dir_name,
                                                 i_input_dir_file, i_stc,
                                                 i_input_dir_len );
-        if ( i_nb_skipped_chunks < 0 )
+        if ( i_nb_skipped_chunks >= 0 ) break;
+
+        if ( i_input_dir_file * i_rotate_size + i_rotate_offset >
+             i_stc + i_duration )
         {
             msg_Err( NULL, "position not found" );
             return -1;
         }
+
+        i_input_dir_file++;
+        msg_Warn( NULL, "missing segment" );
     }
 
     i_input_fd = OpenDirFile( psz_input_dir_name, i_input_dir_file,
@@ -683,7 +738,7 @@ static uint64_t i_output_dir_file;
 
 static ssize_t dir_Write( const void *p_buf, size_t i_len )
 {
-    uint64_t i_dir_file = GetDirFile( i_rotate_size, i_stc );
+    uint64_t i_dir_file = GetDirFile( i_rotate_size, i_rotate_offset, i_stc );
     if ( !i_output_fd || i_dir_file != i_output_dir_file )
     {
         if ( i_output_fd )
@@ -738,9 +793,8 @@ static void GetPCR( const uint8_t *p_buffer, size_t i_read_size )
         if ( !ts_validate( p_buffer ) )
         {
             msg_Warn( NULL, "invalid TS packet (sync=0x%x)", p_buffer[0] );
-            return;
         }
-        if ( (i_pid == i_pcr_pid || i_pcr_pid == 8192)
+        else if ( (i_pid == i_pcr_pid || i_pcr_pid == 8192)
               && ts_has_adaptation(p_buffer) && ts_get_adaptation(p_buffer)
               && tsaf_has_pcr(p_buffer) )
         {
@@ -753,16 +807,141 @@ static void GetPCR( const uint8_t *p_buffer, size_t i_read_size )
 }
 
 /*****************************************************************************
+ * FixCC: fix continuity counters
+ *****************************************************************************/
+static void FixCC( uint8_t *p_buffer, size_t i_read_size )
+{
+    while ( i_read_size >= TS_SIZE )
+    {
+        uint16_t i_pid = ts_get_pid( p_buffer );
+
+        if ( !ts_validate( p_buffer ) )
+        {
+            msg_Warn( NULL, "invalid TS packet (sync=0x%x)", p_buffer[0] );
+        }
+        else
+        {
+            if ( pi_pid_cc_table[i_pid] == 0x10 )
+            {
+                msg_Dbg( NULL, "new pid entry %d", i_pid );
+                pi_pid_cc_table[i_pid] = 0;
+            }
+            else if ( ts_has_payload( p_buffer ) )
+            {
+                pi_pid_cc_table[i_pid] = (pi_pid_cc_table[i_pid] + 1) % 0x10; 
+            }
+            ts_set_cc( p_buffer, pi_pid_cc_table[i_pid] );
+        }
+        p_buffer += TS_SIZE;
+        i_read_size -= TS_SIZE;
+    }
+}
+
+/*****************************************************************************
+ * RestampPCR
+ *****************************************************************************/
+static void RestampPCR(uint8_t *p_ts)
+{
+    uint64_t i_pcr = tsaf_get_pcr(p_ts) * 300 + tsaf_get_pcrext(p_ts);
+    bool b_discontinuity = tsaf_has_discontinuity(p_ts);
+
+    if (i_last_pcr == TS_CLOCK_MAX)
+        i_last_pcr = i_pcr;
+    else {
+        /* handle 2^33 wrap-arounds */
+        uint64_t i_delta =
+            (TS_CLOCK_MAX + i_pcr -
+             (i_last_pcr % TS_CLOCK_MAX)) % TS_CLOCK_MAX;
+        if (i_delta <= MAX_PCR_INTERVAL && !b_discontinuity)
+            i_last_pcr = i_pcr;
+        else {
+            msg_Warn( NULL, "PCR discontinuity (%"PRIu64")", i_delta );
+            i_last_pcr += i_stc - i_last_pcr_date;
+            i_last_pcr %= TS_CLOCK_MAX;
+            i_pcr_offset += TS_CLOCK_MAX + i_last_pcr - i_pcr;
+            i_pcr_offset %= TS_CLOCK_MAX;
+            i_last_pcr = i_pcr;
+        }
+    }
+    i_last_pcr_date = i_stc;
+    if (!i_pcr_offset)
+        return;
+
+    i_pcr += i_pcr_offset;
+    i_pcr %= TS_CLOCK_MAX;
+    tsaf_set_pcr(p_ts, i_pcr / 300);
+    tsaf_set_pcrext(p_ts, i_pcr % 300);
+    tsaf_clear_discontinuity(p_ts);
+}
+
+/*****************************************************************************
+ * RestampTS
+ *****************************************************************************/
+static uint64_t RestampTS(uint64_t i_ts)
+{
+    i_ts += i_pcr_offset;
+    i_ts %= TS_CLOCK_MAX;
+    return i_ts;
+}
+
+/*****************************************************************************
+ * Restamp: Restamp PCRs, DTSs and PTSs
+ *****************************************************************************/
+static void Restamp( uint8_t *p_buffer, size_t i_read_size )
+{
+    while ( i_read_size >= TS_SIZE )
+    {
+        if ( !ts_validate( p_buffer ) )
+        {
+            msg_Warn( NULL, "invalid TS packet (sync=0x%x)", p_buffer[0] );
+        }
+        else
+        {
+            if (ts_has_adaptation(p_buffer) && ts_get_adaptation(p_buffer) &&
+                tsaf_has_pcr(p_buffer))
+                RestampPCR(p_buffer);
+
+            uint16_t header_size = TS_HEADER_SIZE +
+                                   (ts_has_adaptation(p_buffer) ? 1 : 0) +
+                                   ts_get_adaptation(p_buffer);
+            if (ts_get_unitstart(p_buffer) && ts_has_payload(p_buffer) &&
+                header_size + PES_HEADER_SIZE_PTS <= TS_SIZE &&
+                pes_validate(p_buffer + header_size) &&
+                pes_get_streamid(p_buffer + header_size) !=
+                    PES_STREAM_ID_PRIVATE_2 &&
+                pes_validate_header(p_buffer + header_size) &&
+                pes_has_pts(p_buffer + header_size)
+                /* disable the check as this is a common mistake */
+                /* && pes_validate_pts(p_buffer + header_size) */) {
+                pes_set_pts(p_buffer + header_size,
+                        RestampTS(pes_get_pts(p_buffer + header_size) * 300) /
+                        300);
+
+                if (header_size + PES_HEADER_SIZE_PTSDTS <= TS_SIZE &&
+                    pes_has_dts(p_buffer + header_size)
+                    /* && pes_validate_dts(p_buffer + header_size) */)
+                    pes_set_dts(p_buffer + header_size,
+                        RestampTS(pes_get_dts(p_buffer + header_size) * 300) /
+                        300);
+            }
+        }
+        p_buffer += TS_SIZE;
+        i_read_size -= TS_SIZE;
+    }
+}
+
+/*****************************************************************************
  * Entry point
  *****************************************************************************/
 int main( int i_argc, char **pp_argv )
 {
     int i_priority = -1;
+    const char *psz_syslog_tag = NULL;
     bool b_passthrough = false;
+    bool b_restamp = false;
     int i_stc_fd = -1;
     off_t i_skip_chunks = 0, i_nb_chunks = -1;
     int64_t i_seek = 0;
-    uint64_t i_duration = 0;
     bool b_append = false;
     uint8_t *p_buffer, *p_read_buffer;
     size_t i_max_read_size, i_max_write_size;
@@ -771,12 +950,16 @@ int main( int i_argc, char **pp_argv )
     sigset_t set;
 
     /* Parse options */
-    while ( (c = getopt( i_argc, pp_argv, "i:t:XT:fp:s:n:k:d:ar:S:uUm:R:wh" )) != -1 )
+    while ( (c = getopt( i_argc, pp_argv, "i:l:t:XT:fp:CPs:n:k:d:ar:O:S:uUm:R:wh" )) != -1 )
     {
         switch ( c )
         {
         case 'i':
             i_priority = strtol( optarg, NULL, 0 );
+            break;
+
+        case 'l':
+            psz_syslog_tag = optarg;
             break;
 
         case 't':
@@ -802,6 +985,15 @@ int main( int i_argc, char **pp_argv )
             i_pcr_pid = strtol( optarg, NULL, 0 );
             break;
 
+        case 'C':
+            pi_pid_cc_table = malloc(MAX_PIDS * sizeof(uint8_t));
+            memset(pi_pid_cc_table, 0x10, MAX_PIDS * sizeof(uint8_t));
+            break;
+
+        case 'P':
+            b_restamp = true;
+            break;
+
         case 's':
             i_skip_chunks = strtol( optarg, NULL, 0 );
             break;
@@ -824,6 +1016,10 @@ int main( int i_argc, char **pp_argv )
 
         case 'r':
             i_rotate_size = strtoull( optarg, NULL, 0 );
+            break;
+
+        case 'O':
+            i_rotate_offset = strtoull( optarg, NULL, 0 );
             break;
 
         case 'S':
@@ -864,6 +1060,9 @@ int main( int i_argc, char **pp_argv )
     }
     if ( optind >= i_argc - 1 )
         usage();
+
+    if ( psz_syslog_tag != NULL )
+        msg_Openlog( psz_syslog_tag, LOG_NDELAY, LOG_USER );
 
     /* Open sockets */
     if ( udp_InitRead( pp_argv[optind], i_asked_payload_size, i_skip_chunks,
@@ -993,6 +1192,10 @@ int main( int i_argc, char **pp_argv )
             i_payload_size = i_read_size;
         }
 
+        /* Skip last incomplete TS packet */
+        i_read_size -= i_payload_size % TS_SIZE;
+        i_payload_size -= i_payload_size % TS_SIZE;
+
         /* Pad to get the asked payload size */
         while ( i_payload_size + TS_SIZE <= i_asked_payload_size )
         {
@@ -1000,6 +1203,14 @@ int main( int i_argc, char **pp_argv )
             i_read_size += TS_SIZE;
             i_payload_size += TS_SIZE;
         }
+
+        /* Fix continuity counters */
+        if ( pi_pid_cc_table != NULL )
+            FixCC( p_payload, i_payload_size );
+
+        /* Restamp */
+        if ( b_restamp )
+            Restamp( p_payload, i_payload_size );
 
         /* Prepare header and size of output */
         if ( b_output_udp )
@@ -1076,9 +1287,14 @@ dropped_packet:
             break;
     }
 
+    free(pi_pid_cc_table);
+    free(p_buffer);
+
     pf_ExitRead();
     pf_ExitWrite();
 
-    return EXIT_SUCCESS;
-}
+    if ( psz_syslog_tag != NULL )
+        msg_Closelog();
 
+    return b_error ? EXIT_FAILURE : EXIT_SUCCESS;
+}

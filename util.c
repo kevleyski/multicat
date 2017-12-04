@@ -1,7 +1,7 @@
 /*****************************************************************************
  * util.c: Utils for the multicat suite
  *****************************************************************************
- * Copyright (C) 2004, 2009, 2011 VideoLAN
+ * Copyright (C) 2004, 2009, 2011, 2015-2016 VideoLAN
  * $Id$
  *
  * Authors: Christophe Massiot <massiot@via.ecp.fr>
@@ -20,6 +20,8 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************/
+
+#define _GNU_SOURCE
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -42,6 +44,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <netdb.h>
+#include <syslog.h>
 
 #include "util.h"
 
@@ -55,32 +58,49 @@
 #define PSZ_TS_EXT "ts"
 
 int i_verbose = VERB_DBG;
+static int b_syslog = 0;
 
 /*****************************************************************************
- * sockaddr_t: wrapper to avoid strict-aliasing issues
+ * msg_Openlog
  *****************************************************************************/
-typedef union
+void msg_Openlog( const char *ident, int option, int facility )
 {
-    struct sockaddr_storage ss;
-    struct sockaddr so;
-    struct sockaddr_in sin;
-    struct sockaddr_in6 sin6;
-} sockaddr_t;
+    openlog(ident, option, facility);
+    b_syslog = 1;
+}
+
+/*****************************************************************************
+ * msg_Closelog
+ *****************************************************************************/
+void msg_Closelog( void )
+{
+    closelog();
+    b_syslog = 0;
+}
 
 /*****************************************************************************
  * msg_Info
  *****************************************************************************/
 void msg_Info( void *_unused, const char *psz_format, ... )
 {
-    if ( i_verbose >= VERB_INFO )
-    {
-        va_list args;
-        char psz_fmt[MAX_MSG];
-        va_start( args, psz_format );
+    if ( i_verbose < VERB_INFO )
+        return;
 
+    va_list args;
+    va_start( args, psz_format );
+
+    if ( !b_syslog )
+    {
+        char psz_fmt[MAX_MSG];
         snprintf( psz_fmt, MAX_MSG, "info: %s\n", psz_format );
         vfprintf( stderr, psz_fmt, args );
     }
+    else
+    {
+        vsyslog( LOG_INFO, psz_format, args );
+    }
+
+    va_end( args );
 }
 
 /*****************************************************************************
@@ -89,11 +109,20 @@ void msg_Info( void *_unused, const char *psz_format, ... )
 void msg_Err( void *_unused, const char *psz_format, ... )
 {
     va_list args;
-    char psz_fmt[MAX_MSG];
     va_start( args, psz_format );
 
-    snprintf( psz_fmt, MAX_MSG, "error: %s\n", psz_format );
-    vfprintf( stderr, psz_fmt, args );
+    if ( !b_syslog )
+    {
+        char psz_fmt[MAX_MSG];
+        snprintf( psz_fmt, MAX_MSG, "error: %s\n", psz_format );
+        vfprintf( stderr, psz_fmt, args );
+    }
+    else
+    {
+        vsyslog( LOG_ERR, psz_format, args );
+    }
+
+    va_end( args );
 }
 
 /*****************************************************************************
@@ -101,15 +130,24 @@ void msg_Err( void *_unused, const char *psz_format, ... )
  *****************************************************************************/
 void msg_Warn( void *_unused, const char *psz_format, ... )
 {
-    if ( i_verbose >= VERB_WARN )
-    {
-        va_list args;
-        char psz_fmt[MAX_MSG];
-        va_start( args, psz_format );
+    if ( i_verbose < VERB_WARN )
+        return;
 
+    va_list args;
+    va_start( args, psz_format );
+
+    if ( !b_syslog )
+    {
+        char psz_fmt[MAX_MSG];
         snprintf( psz_fmt, MAX_MSG, "warning: %s\n", psz_format );
         vfprintf( stderr, psz_fmt, args );
     }
+    else
+    {
+        vsyslog( LOG_WARNING, psz_format, args );
+    }
+
+    va_end( args );
 }
 
 /*****************************************************************************
@@ -117,19 +155,28 @@ void msg_Warn( void *_unused, const char *psz_format, ... )
  *****************************************************************************/
 void msg_Dbg( void *_unused, const char *psz_format, ... )
 {
-    if ( i_verbose >= VERB_DBG )
-    {
-        va_list args;
-        char psz_fmt[MAX_MSG];
-        va_start( args, psz_format );
+    if ( i_verbose < VERB_DBG )
+        return;
 
+    va_list args;
+    va_start( args, psz_format );
+
+    if ( !b_syslog )
+    {
+        char psz_fmt[MAX_MSG];
         snprintf( psz_fmt, MAX_MSG, "debug: %s\n", psz_format );
         vfprintf( stderr, psz_fmt, args );
     }
+    else
+    {
+        vsyslog( LOG_DEBUG, psz_format, args );
+    }
+
+    va_end( args );
 }
 
 /*****************************************************************************
- * msg_Raw
+ * msg_Raw: only used for usage()
  *****************************************************************************/
 void msg_Raw( void *_unused, const char *psz_format, ... )
 {
@@ -139,6 +186,7 @@ void msg_Raw( void *_unused, const char *psz_format, ... )
 
     snprintf( psz_fmt, MAX_MSG, "%s\n", psz_format );
     vfprintf( stderr, psz_fmt, args );
+    va_end( args );
 }
 
 /*****************************************************************************
@@ -216,7 +264,7 @@ void real_Sleep( uint64_t i_delay )
  *****************************************************************************/
 static int GetInterfaceIndex( const char *psz_name )
 {
-#ifndef __FreeBSD__
+#if !defined(__APPLE__)
     int i_fd;
     struct ifreq ifr;
 
@@ -237,7 +285,11 @@ static int GetInterfaceIndex( const char *psz_name )
 
     close( i_fd );
 
+#if defined(__FreeBSD__)
+    return ifr.ifr_index;
+#else
     return ifr.ifr_ifindex;
+#endif
 #else
     return 0;
 #endif
@@ -352,7 +404,11 @@ static struct addrinfo *ParseNodeService( char *_psz_string, char **ppsz_end,
         struct in_addr addr;
         if ( inet_aton( psz_node, &addr ) != 0 )
         {
-            struct sockaddr_in *p_sin = malloc( sizeof(struct sockaddr_in) );
+            uint8_t *p_buffer = malloc( sizeof(struct addrinfo) +
+                                        sizeof(struct sockaddr_in) );
+            p_res = (struct addrinfo *)p_buffer;
+            struct sockaddr_in *p_sin =
+                (struct sockaddr_in *)(p_buffer + sizeof(struct addrinfo));
             p_sin->sin_family = AF_INET;
             if ( psz_port != NULL )
                 p_sin->sin_port = ntohs( atoi( psz_port ) );
@@ -360,7 +416,6 @@ static struct addrinfo *ParseNodeService( char *_psz_string, char **ppsz_end,
                 p_sin->sin_port = 0;
             p_sin->sin_addr = addr;
 
-            p_res = malloc( sizeof(struct addrinfo) );
             p_res->ai_family = AF_INET;
             p_res->ai_socktype = SOCK_DGRAM;
             p_res->ai_protocol = 0;
@@ -398,7 +453,12 @@ static void RawFillHeaders(struct udprawpkt *dgram,
                         uint16_t portsrc, uint16_t portdst,
                         uint8_t ttl, uint8_t tos, uint16_t len)
 {
+#ifndef __APPLE__
+#if defined(__FreeBSD__)
+    struct ip *iph = &(dgram->iph);
+#else
     struct iphdr *iph = &(dgram->iph);
+#endif
     struct udphdr *udph = &(dgram->udph);
 
 #ifdef DEBUG_SOCKET
@@ -411,6 +471,26 @@ static void RawFillHeaders(struct udprawpkt *dgram,
     printf("Filling raw header (%p) (%s:%u -> %s:%u)\n", dgram, ipsrc_str, portsrc, ipdst_str, portdst);
 #endif
 
+#if defined(__FreeBSD__)
+    // Fill ip header
+    iph->ip_hl    = 5;              // ip header with no specific option
+    iph->ip_v     = 4;
+    iph->ip_tos   = tos;
+    iph->ip_len   = sizeof(struct udprawpkt) + len; // auto-htoned ?
+    iph->ip_id    = htons(0);       // auto-generated if frag_off (flags) = 0 ?
+    iph->ip_off   = 0;
+    iph->ip_ttl   = ttl;
+    iph->ip_p     = IPPROTO_UDP;
+    iph->ip_sum   = 0;
+    iph->ip_src.s_addr = ipsrc;
+    iph->ip_dst.s_addr = ipdst;
+
+    // Fill udp header
+    udph->uh_sport = htons(portsrc);
+    udph->uh_dport = htons(portdst);
+    udph->uh_ulen  = htons(sizeof(struct udphdr) + len);
+    udph->uh_sum   = 0;
+#else
     // Fill ip header
     iph->ihl      = 5;              // ip header with no specific option
     iph->version  = 4;
@@ -425,20 +505,15 @@ static void RawFillHeaders(struct udprawpkt *dgram,
     iph->daddr    = ipdst;
 
     // Fill udp header
-    #ifdef __FAVOR_BSD
-    udph->uh_sport = htons(portsrc);
-    udph->uh_dport = htons(portdst);
-    udph->uh_ulen  = htons(sizeof(struct udphdr) + len);
-    udph->uh_sum   = 0;
-    #else
     udph->source = htons(portsrc);
     udph->dest   = htons(portdst);
     udph->len    = htons(sizeof(struct udphdr) + len);
     udph->check  = 0;
-    #endif
+#endif
 
     // Compute ip header checksum. Computed by kernel when frag_off = 0 ?
     //iph->check = csum((unsigned short *)iph, sizeof(struct iphdr));
+#endif
 }
 
 /*****************************************************************************
@@ -467,7 +542,7 @@ int OpenSocket( const char *_psz_arg, int i_ttl, uint16_t i_bind_port,
                 struct opensocket_opt *p_opt)
 {
     sockaddr_t bind_addr, connect_addr;
-    int i_fd, i;
+    int i_fd = -1, i;
     char *psz_arg = strdup(_psz_arg);
     char *psz_token = psz_arg;
     char *psz_token2 = NULL;
@@ -480,8 +555,12 @@ int OpenSocket( const char *_psz_arg, int i_ttl, uint16_t i_bind_port,
     socklen_t i_sockaddr_len;
     bool b_host = false;
     bool b_raw_packets = false;
-    in_addr_t i_raw_srcaddr = INADDR_ANY; 
+    in_addr_t i_raw_srcaddr = INADDR_ANY;
     int i_raw_srcport = 0;
+    char *psz_ifname = NULL;
+#ifdef __FreeBSD__
+    int hincl = 1;
+#endif
 
     bind_addr.ss.ss_family = AF_UNSPEC;
     connect_addr.ss.ss_family = AF_UNSPEC;
@@ -489,6 +568,9 @@ int OpenSocket( const char *_psz_arg, int i_ttl, uint16_t i_bind_port,
     if ( pb_tcp == NULL )
         pb_tcp = &b_tcp;
     *pb_tcp = false;
+
+    if ( p_opt != NULL && p_opt->pb_multicast != NULL )
+        *p_opt->pb_multicast = false;
 
     psz_token2 = strrchr( psz_arg, ',' );
     if ( psz_token2 )
@@ -561,8 +643,15 @@ int OpenSocket( const char *_psz_arg, int i_ttl, uint16_t i_bind_port,
             else if ( IS_OPTION("ifaddr=") )
             {
                 char *option = config_stropt( ARG_OPTION("ifaddr=") );
-                i_if_addr = inet_addr( ARG_OPTION("ifaddr=") );
+                i_if_addr = inet_addr( option );
                 free( option );
+            }
+            else if ( IS_OPTION("ifname=") )
+            {
+                psz_ifname = config_stropt( ARG_OPTION("ifname=") );
+                if (strlen(psz_ifname) >= IFNAMSIZ) {
+                    psz_ifname[IFNAMSIZ-1] = '\0';
+                }
             }
             else if ( IS_OPTION("ttl=") )
                 i_ttl = strtol( ARG_OPTION("ttl="), NULL, 0 );
@@ -578,6 +667,8 @@ int OpenSocket( const char *_psz_arg, int i_ttl, uint16_t i_bind_port,
             }
             else if ( IS_OPTION("srcport=") )
                 i_raw_srcport = strtol( ARG_OPTION("srcport="), NULL, 0 );
+            else if ( IS_OPTION("fd=") )
+                i_fd = strtol( ARG_OPTION("fd="), NULL, 0 );
             else
                 msg_Warn( NULL, "unrecognized option %s", psz_token2 );
 
@@ -619,81 +710,97 @@ int OpenSocket( const char *_psz_arg, int i_ttl, uint16_t i_bind_port,
     else i_connect_if_index = i_bind_if_index;
 
     /* Socket configuration */
-    if (b_raw_packets && b_host) { 
-        RawFillHeaders(p_opt->p_raw_pktheader,
-            i_raw_srcaddr, connect_addr.sin.sin_addr.s_addr, i_raw_srcport,
-            ntohs(connect_addr.sin.sin_port), i_ttl, i_tos, 0);
-        i_fd = socket( AF_INET, SOCK_RAW, IPPROTO_RAW );
-    } else {
-        i_fd = socket( i_family, *pb_tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
-    }
     if ( i_fd < 0 )
     {
-        msg_Err( NULL, "unable to open socket (%s)", strerror(errno) );
-        exit(EXIT_FAILURE);
-    }
-
-    i = 1;
-    if ( setsockopt( i_fd, SOL_SOCKET, SO_REUSEADDR, (void *)&i,
-                     sizeof(i) ) == -1 )
-    {
-        msg_Err( NULL, "unable to set socket (%s)", strerror(errno) );
-        exit(EXIT_FAILURE);
-    }
-
-    if ( i_family == AF_INET6 )
-    {
-        if ( i_bind_if_index
-              && setsockopt( i_fd, IPPROTO_IPV6, IPV6_MULTICAST_IF,
-                     (void *)&i_bind_if_index, sizeof(i_bind_if_index) ) < 0 )
-        {
-            msg_Err( NULL, "couldn't set interface index" );
-            PrintSocket( "socket definition:", &bind_addr, &connect_addr );
-            exit(EXIT_FAILURE);
-        }
-
-        if ( bind_addr.ss.ss_family != AF_UNSPEC )
-        {
-            if ( IN6_IS_ADDR_MULTICAST( &bind_addr.sin6.sin6_addr ) )
+        if (b_raw_packets && b_host)
+        { 
+            RawFillHeaders(p_opt->p_raw_pktheader,
+                i_raw_srcaddr, connect_addr.sin.sin_addr.s_addr, i_raw_srcport,
+                ntohs(connect_addr.sin.sin_port), i_ttl, i_tos, 0);
+            i_fd = socket( AF_INET, SOCK_RAW, IPPROTO_RAW );
+#ifdef __FreeBSD__
+            if ( setsockopt( i_fd, IPPROTO_IP, IP_HDRINCL, &hincl, sizeof(hincl)) == -1 )
             {
-                struct ipv6_mreq imr;
-                sockaddr_t bind_addr_any = bind_addr;
-                bind_addr_any.sin6.sin6_addr = in6addr_any;
-
-                if ( bind( i_fd, &bind_addr_any.so,
-                           sizeof(bind_addr_any) ) < 0 )
-                {
-                    msg_Err( NULL, "couldn't bind" );
-                    PrintSocket( "socket definition:", &bind_addr,
-                                 &connect_addr );
-                    exit(EXIT_FAILURE);
-                }
-
-                imr.ipv6mr_multiaddr = bind_addr.sin6.sin6_addr;
-                imr.ipv6mr_interface = i_bind_if_index;
-
-                /* Join Multicast group without source filter */
-                if ( setsockopt( i_fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
-                                 (char *)&imr, sizeof(struct ipv6_mreq) ) < 0 )
-                {
-                    msg_Err( NULL, "couldn't join multicast group" );
-                    PrintSocket( "socket definition:", &bind_addr,
-                                  &connect_addr );
-                    exit(EXIT_FAILURE);
-                }
+                msg_Err( NULL, "unable to set socket (%s)", strerror(errno) );
+                exit(EXIT_FAILURE);
             }
-            else
-                goto normal_bind;
-        }
-    }
-    else if ( bind_addr.ss.ss_family != AF_UNSPEC )
-    {
-normal_bind:
-        if ( bind( i_fd, &bind_addr.so, i_sockaddr_len ) < 0 )
+#endif
+        } else
+            i_fd = socket( i_family, *pb_tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
+
+        if ( i_fd < 0 )
         {
-            msg_Err( NULL, "couldn't bind" );
-            PrintSocket( "socket definition:", &bind_addr, &connect_addr );
+            msg_Err( NULL, "unable to open socket (%s)", strerror(errno) );
             exit(EXIT_FAILURE);
+        }
+
+        i = 1;
+        if ( setsockopt( i_fd, SOL_SOCKET, SO_REUSEADDR, (void *)&i,
+                         sizeof(i) ) == -1 )
+        {
+            msg_Err( NULL, "unable to set socket (%s)", strerror(errno) );
+            exit(EXIT_FAILURE);
+        }
+
+        if ( i_family == AF_INET6 )
+        {
+            if ( i_bind_if_index
+                  && setsockopt( i_fd, IPPROTO_IPV6, IPV6_MULTICAST_IF,
+                         (void *)&i_bind_if_index, sizeof(i_bind_if_index) ) < 0 )
+            {
+                msg_Err( NULL, "couldn't set interface index" );
+                PrintSocket( "socket definition:", &bind_addr, &connect_addr );
+                exit(EXIT_FAILURE);
+            }
+
+            if ( bind_addr.ss.ss_family != AF_UNSPEC )
+            {
+                #if !defined(__APPLE__) && !defined(__FreeBSD__)
+                if ( IN6_IS_ADDR_MULTICAST( &bind_addr.sin6.sin6_addr ) )
+                {
+                    struct ipv6_mreq imr;
+                    sockaddr_t bind_addr_any = bind_addr;
+                    bind_addr_any.sin6.sin6_addr = in6addr_any;
+
+                    if ( bind( i_fd, &bind_addr_any.so,
+                               sizeof(bind_addr_any) ) < 0 )
+                    {
+                        msg_Err( NULL, "couldn't bind" );
+                        PrintSocket( "socket definition:", &bind_addr,
+                                     &connect_addr );
+                        exit(EXIT_FAILURE);
+                    }
+
+                    imr.ipv6mr_multiaddr = bind_addr.sin6.sin6_addr;
+                    imr.ipv6mr_interface = i_bind_if_index;
+
+                    /* Join Multicast group without source filter */
+                    if ( setsockopt( i_fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
+                                     (char *)&imr, sizeof(struct ipv6_mreq) ) < 0 )
+                    {
+                        msg_Err( NULL, "couldn't join multicast group" );
+                        PrintSocket( "socket definition:", &bind_addr,
+                                      &connect_addr );
+                        exit(EXIT_FAILURE);
+                    }
+
+                    if ( p_opt != NULL && p_opt->pb_multicast != NULL )
+                        *p_opt->pb_multicast = true;
+                }
+                else
+                #endif
+                    goto normal_bind;
+            }
+        }
+        else if ( bind_addr.ss.ss_family != AF_UNSPEC )
+        {
+normal_bind:
+            if ( bind( i_fd, &bind_addr.so, i_sockaddr_len ) < 0 )
+            {
+                msg_Err( NULL, "couldn't bind" );
+                PrintSocket( "socket definition:", &bind_addr, &connect_addr );
+                exit(EXIT_FAILURE);
+            }
         }
     }
 
@@ -768,7 +875,22 @@ normal_bind:
                     exit(EXIT_FAILURE);
                 }
             }
+#ifdef SO_BINDTODEVICE
+            if (psz_ifname) {
+                if ( setsockopt( i_fd, SOL_SOCKET, SO_BINDTODEVICE,
+                                 psz_ifname, strlen(psz_ifname)+1 ) < 0 ) {
+                    msg_Err( NULL, "couldn't bind to device %s (%s)",
+                             psz_ifname, strerror(errno) );
+                    exit(EXIT_FAILURE);
+                }
+                free(psz_ifname);
+                psz_ifname = NULL;
+            }
+#endif
         }
+
+        if ( p_opt != NULL && p_opt->pb_multicast != NULL )
+            *p_opt->pb_multicast = true;
     }
 
     if ( connect_addr.ss.ss_family != AF_UNSPEC )
@@ -880,7 +1002,7 @@ int OpenFile( const char *psz_arg, bool b_read, bool b_append )
         {
             msg_Err( NULL, "file %s doesn't exist (%s)", psz_arg,
                      strerror(errno) );
-            exit(EXIT_FAILURE);
+            return -1;
         }
         i_mode |= O_CREAT;
     }
@@ -895,7 +1017,7 @@ int OpenFile( const char *psz_arg, bool b_read, bool b_append )
     if ( (i_fd = open( psz_arg, i_mode, 0644 )) < 0 )
     {
         msg_Err( NULL, "couldn't open file %s (%s)", psz_arg, strerror(errno) );
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     return i_fd;
@@ -1012,7 +1134,7 @@ off_t LookupAuxFile( const char *psz_arg, int64_t i_wanted, bool b_absolute )
     munmap( p_aux, stc_stat.st_size );
     close( i_stc_fd );
 
-    return i_offset2;
+    return i_offset1;
 }
 
 /*****************************************************************************
@@ -1069,14 +1191,15 @@ void CheckFileSizes( const char *psz_file, const char *psz_aux_file,
 /*****************************************************************************
  * GetDirFile: return the prefix of the file according to the STC
  *****************************************************************************/
-uint64_t GetDirFile( uint64_t i_rotate_size, int64_t i_wanted )
+uint64_t GetDirFile( uint64_t i_rotate_size, uint64_t i_rotate_offset,
+                     int64_t i_wanted )
 {
     if ( i_wanted <= 0 )
         i_wanted += real_Date();
     if ( i_wanted <= 0 )
         return 0;
 
-    return i_wanted / i_rotate_size;
+    return (i_wanted - i_rotate_offset) / i_rotate_size;
 }
 
 /*****************************************************************************
